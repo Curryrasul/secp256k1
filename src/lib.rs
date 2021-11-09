@@ -1,5 +1,6 @@
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use serde::{Serialize, Deserialize};
+use solana_program::instruction::Instruction;
 
 pub const HASHED_PUBKEY_SERIALIZED_SIZE: usize = 20;
 pub const SIGNATURE_SERIALIZED_SIZE: usize = 64;
@@ -17,18 +18,26 @@ pub struct SecpSignatureOffsets {
     pub message_instruction_index: u8,
 }
 
-type Sig = (libsecp256k1::Signature, libsecp256k1::RecoveryId);
+pub fn new_secp256k1_instruction(
+    priv_keys: &[libsecp256k1::SecretKey],
+    message_arr: &[u8],
+) -> Instruction {
+    let number_of_signatures = priv_keys.len();
 
-pub fn new_secp256k1_instruction(priv_keys: &[libsecp256k1::SecretKey], message_arr: &[u8]) {
-    let secp_pubkeys: Vec<libsecp256k1::PublicKey> = priv_keys
+    let secp_pubkeys: Vec<_> = priv_keys
         .iter()
         .map(|priv_key| libsecp256k1::PublicKey::from_secret_key(priv_key))
         .collect();
 
-    let eth_pubkeys: Vec<[u8; HASHED_PUBKEY_SERIALIZED_SIZE]> = secp_pubkeys
+    let eth_pubkeys: Vec<_> = secp_pubkeys
         .iter()
-        .map(|secp_pubkey| construct_eth_pubkey(&secp_pubkey))
+        .flat_map(|secp_pubkey| construct_eth_pubkey(&secp_pubkey))
         .collect();
+
+    assert_eq!(
+        eth_pubkeys.len(),
+        number_of_signatures * HASHED_PUBKEY_SERIALIZED_SIZE
+    );
 
     let mut hasher = Keccak256::new();
     hasher.update(&message_arr);
@@ -37,61 +46,63 @@ pub fn new_secp256k1_instruction(priv_keys: &[libsecp256k1::SecretKey], message_
     message_hash_arr.copy_from_slice(message_hash.as_slice());
     let message = libsecp256k1::Message::parse(&message_hash_arr);
 
-    let sigs: Vec<Sig> = priv_keys
+    let sigs: Vec<_> = priv_keys
         .iter()
         .map(|priv_key| libsecp256k1::sign(&message, priv_key))
         .collect();
-        
-    let signature_arr = sigs[0].0.serialize();
 
-    // let (signature, recovery_id) = libsecp256k1::sign(&message, priv_key);
-    // let signature_arr = signature.serialize();
-    // assert_eq!(signature_arr.len(), SIGNATURE_SERIALIZED_SIZE);
+    let signature_arr: Vec<_> = sigs.iter().flat_map(|sig| sig.0.serialize()).collect();
 
-    // let mut instruction_data = vec![];
-    // instruction_data.resize(
-    //     DATA_START
-    //         .saturating_add(eth_pubkey.len())
-    //         .saturating_add(signature_arr.len())
-    //         .saturating_add(message_arr.len())
-    //         .saturating_add(1),
-    //     0,
-    // );
-    // let eth_address_offset = DATA_START;
-    // instruction_data[eth_address_offset..eth_address_offset.saturating_add(eth_pubkey.len())]
-    //     .copy_from_slice(&eth_pubkey);
+    let recoveries_arr: Vec<_> = sigs.iter().map(|sig| sig.1.serialize()).collect();
 
-    // let signature_offset = DATA_START.saturating_add(eth_pubkey.len());
-    // instruction_data[signature_offset..signature_offset.saturating_add(signature_arr.len())]
-    //     .copy_from_slice(&signature_arr);
+    assert_eq!(
+        signature_arr.len(),
+        number_of_signatures * SIGNATURE_SERIALIZED_SIZE
+    );
 
-    // instruction_data[signature_offset.saturating_add(signature_arr.len())] =
-    //     recovery_id.serialize();
+    let mut instruction_data = vec![];
+    instruction_data.resize(
+        DATA_START
+            .saturating_add(eth_pubkeys.len())
+            .saturating_add(signature_arr.len())
+            .saturating_add(message_arr.len())
+            .saturating_add(number_of_signatures),
+        0,
+    );
 
-    // let message_data_offset = signature_offset
-    //     .saturating_add(signature_arr.len())
-    //     .saturating_add(1);
-    // instruction_data[message_data_offset..].copy_from_slice(message_arr);
+    let eth_address_offset = DATA_START;
+    instruction_data[eth_address_offset..eth_address_offset.saturating_add(eth_pubkeys.len())]
+        .copy_from_slice(&eth_pubkeys);
 
-    // let num_signatures = 1;
-    // instruction_data[0] = num_signatures;
-    // let offsets = SecpSignatureOffsets {
-    //     signature_offset: signature_offset as u16,
-    //     signature_instruction_index: 0,
-    //     eth_address_offset: eth_address_offset as u16,
-    //     eth_address_instruction_index: 0,
-    //     message_data_offset: message_data_offset as u16,
-    //     message_data_size: message_arr.len() as u16,
-    //     message_instruction_index: 0,
-    // };
-    // let writer = std::io::Cursor::new(&mut instruction_data[1..DATA_START]);
-    // bincode::serialize_into(writer, &offsets).unwrap();
+    let signature_offset = DATA_START.saturating_add(eth_pubkeys.len());
+    instruction_data[signature_offset..signature_offset.saturating_add(signature_arr.len())]
+        .copy_from_slice(&signature_arr);
 
-    // Instruction {
-    //     program_id: solana_sdk::secp256k1_program::id(),
-    //     accounts: vec![],
-    //     data: instruction_data,
-    // }
+    let recoveries_offset = signature_offset.saturating_add(signature_arr.len());
+    instruction_data[recoveries_offset..recoveries_offset.saturating_add(recoveries_arr.len())]
+        .copy_from_slice(&recoveries_arr);
+
+    let message_data_offset = recoveries_offset.saturating_add(recoveries_arr.len());
+    instruction_data[message_data_offset..].copy_from_slice(message_arr);
+
+    instruction_data[0] = number_of_signatures as u8;
+    let offsets = SecpSignatureOffsets {
+        signature_offset: signature_offset as u16,
+        signature_instruction_index: 0,
+        eth_address_offset: eth_address_offset as u16,
+        eth_address_instruction_index: 0,
+        message_data_offset: message_data_offset as u16,
+        message_data_size: message_arr.len() as u16,
+        message_instruction_index: 0,
+    };
+    let writer = std::io::Cursor::new(&mut instruction_data[1..DATA_START]);
+    bincode::serialize_into(writer, &offsets).unwrap();
+
+    Instruction {
+        program_id: solana_sdk::secp256k1_program::id(),
+        accounts: vec![],
+        data: instruction_data,
+    }
 }
 
 pub fn construct_eth_pubkey(
