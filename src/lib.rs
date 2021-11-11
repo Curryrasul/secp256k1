@@ -4,14 +4,15 @@ use solana_program::instruction::Instruction;
 
 pub const HASHED_PUBKEY_SERIALIZED_SIZE: usize = 20;
 pub const SIGNATURE_SERIALIZED_SIZE: usize = 64;
-pub const SIGNATURE_OFFSETS_SERIALIZED_SIZE: usize = 11;
+pub const SIGNATURE_OFFSETS_SERIALIZED_SIZE: usize = 13;
 pub const DATA_START: usize = SIGNATURE_OFFSETS_SERIALIZED_SIZE + 1;
 
 #[derive(Default, Serialize, Deserialize, Debug)]
 pub struct SecpSignatureOffsets {
-    pub signature_offset: u16, // offset to [signature,recovery_id] of 64+1 bytes
+    pub signature_offset: u16, // offset to signatures
     pub signature_instruction_index: u8,
-    pub eth_address_offset: u16, // offset to eth_address of 20 bytes
+    pub recoveries_offset: u16,  // offset to recoveries
+    pub eth_address_offset: u16, // offset to eth_addresses
     pub eth_address_instruction_index: u8,
     pub message_data_offset: u16, // offset to start of message data
     pub message_data_size: u16,   // size of message data
@@ -60,13 +61,16 @@ pub fn new_secp256k1_instruction(
         number_of_signatures * SIGNATURE_SERIALIZED_SIZE
     );
 
+    assert_eq!(recoveries_arr.len(), number_of_signatures);
+
     let mut instruction_data = vec![];
     instruction_data.resize(
         DATA_START
             .saturating_add(eth_pubkeys.len())
             .saturating_add(signature_arr.len())
+            .saturating_add(recoveries_arr.len())
             .saturating_add(message_arr.len())
-            .saturating_add(number_of_signatures),
+            .saturating_add(1),
         0,
     );
 
@@ -89,12 +93,14 @@ pub fn new_secp256k1_instruction(
     let offsets = SecpSignatureOffsets {
         signature_offset: signature_offset as u16,
         signature_instruction_index: 0,
+        recoveries_offset: recoveries_offset as u16,
         eth_address_offset: eth_address_offset as u16,
         eth_address_instruction_index: 0,
         message_data_offset: message_data_offset as u16,
         message_data_size: message_arr.len() as u16,
         message_instruction_index: 0,
     };
+
     let writer = std::io::Cursor::new(&mut instruction_data[1..DATA_START]);
     bincode::serialize_into(writer, &offsets).unwrap();
 
